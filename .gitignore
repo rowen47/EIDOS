@@ -1,0 +1,11 @@
+venv/
+pycache/
+*.pyc
+data/
+*.nii.gz
+*.zip
+*.tar
+models/
+*.pt
+*.pth
+.DS_Store
