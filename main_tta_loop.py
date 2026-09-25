@@ -58,7 +58,7 @@ CFG = dict(
 
     # Data
     roi_size=(64, 64, 64),
-    num_patients=5,           # evaluate exactly 5 patients
+    num_patients=125,         # evaluate exactly 125 patients
 
     # TTA loop
     tta_iterations=5,
