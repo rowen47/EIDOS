@@ -9,3 +9,5 @@ models/
 *.pt
 *.pth
 .DS_Store
+.pdf
+.png

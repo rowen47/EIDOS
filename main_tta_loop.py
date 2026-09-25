@@ -7,7 +7,7 @@ real BraTS patient volumes.
 
 Clinical Workflow per patient:
     1. Baseline: Forward pass WITHOUT TTA  -> Pre-TTA Dice
-    2. Adaptation: 5 iterations of TTA optimisation (entropy + energy prior)
+    2. Adaptation: 10 iterations of TTA optimisation (entropy + energy prior)
     3. Evaluation: Forward pass WITH updated adaptors  -> Post-TTA Dice
 
 Outputs a formatted ASCII results table suitable for a research paper.
@@ -20,12 +20,17 @@ from __future__ import annotations
 import os
 import sys
 import warnings
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")                         # non-interactive backend (safe on all OS)
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
 # ---------------------------------------------------------------------------
 # EIDOS module imports
@@ -61,7 +66,7 @@ CFG = dict(
     num_patients=125,         # evaluate exactly 125 patients
 
     # TTA loop
-    tta_iterations=5,
+    tta_iterations=10,
 
     # Optimiser
     lr=1e-3,
@@ -69,7 +74,7 @@ CFG = dict(
     weight_decay=1e-5,
 
     # Loss
-    lambda_energy=0.05,
+    lambda_energy=0.1,
     temperature=1.0,
 
     # DynamicAdaptor
@@ -406,6 +411,223 @@ def print_results_table(results: List[dict]) -> None:
 
 
 # ===========================================================================
+# PDF Report Generator
+# ===========================================================================
+
+
+def generate_pdf_report(results: List[dict]) -> str:
+    """Generate a timestamped PDF containing the full results report.
+
+    The PDF contains three pages:
+        Page 1 - Main Dice results table (Pre-TTA / Post-TTA / Improvement)
+        Page 2 - Per-class Dice breakdown (NCR, ED, ET)
+        Page 3 - Configuration summary
+
+    Args:
+        results: List of per-patient result dicts (same structure as main loop)
+
+    Returns:
+        Path to the saved PDF file.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"results_report_{timestamp}.pdf"
+
+    # ---- shared style constants ----
+    FONT_FAMILY = "monospace"
+    HDR_COLOR   = "#1a1a2e"      # dark navy
+    ROW_EVEN    = "#f0f4ff"      # pale blue
+    ROW_ODD     = "#ffffff"      # white
+    MEAN_COLOR  = "#d0e8ff"      # accent blue for summary row
+    FIG_BG      = "#fafbff"
+
+    pre_scores  = [r["pre_dice"]  for r in results]
+    post_scores = [r["post_dice"] for r in results]
+    deltas      = [p - r for p, r in zip(post_scores, pre_scores)]
+    avg_pre     = sum(pre_scores)  / len(pre_scores)
+    avg_post    = sum(post_scores) / len(post_scores)
+    avg_delta   = sum(deltas)      / len(deltas)
+
+    with PdfPages(filename) as pdf:
+
+        # =================================================================
+        # PAGE 1 — Main results table
+        # =================================================================
+        fig, ax = plt.subplots(figsize=(11, max(4, 0.35 * len(results) + 3)))
+        fig.patch.set_facecolor(FIG_BG)
+        ax.axis("off")
+
+        # Title
+        fig.text(
+            0.5, 0.97,
+            "EIDOS TTA Quantitative Results — BraTS 2021 Evaluation",
+            ha="center", va="top", fontsize=13, fontweight="bold", color=HDR_COLOR,
+        )
+
+        col_labels = ["Patient ID", "Pre-TTA Dice", "Post-TTA Dice", "Improvement"]
+        table_data = []
+        for i, r in enumerate(results):
+            d = r["post_dice"] - r["pre_dice"]
+            sign = "+" if d >= 0 else ""
+            table_data.append([
+                r["patient_id"],
+                f"{r['pre_dice']:.4f}",
+                f"{r['post_dice']:.4f}",
+                f"{sign}{d:.4f}",
+            ])
+
+        # Summary row
+        sign_avg = "+" if avg_delta >= 0 else ""
+        table_data.append([
+            "MEAN",
+            f"{avg_pre:.4f}",
+            f"{avg_post:.4f}",
+            f"{sign_avg}{avg_delta:.4f}",
+        ])
+
+        row_colors = [
+            [ROW_EVEN if i % 2 == 0 else ROW_ODD] * 4
+            for i in range(len(results))
+        ] + [[MEAN_COLOR] * 4]
+
+        tbl = ax.table(
+            cellText=table_data,
+            colLabels=col_labels,
+            cellColours=row_colors,
+            cellLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.auto_set_column_width([0, 1, 2, 3])
+
+        # Style header row
+        for col in range(len(col_labels)):
+            cell = tbl[0, col]
+            cell.set_facecolor(HDR_COLOR)
+            cell.set_text_props(color="white", fontweight="bold", family=FONT_FAMILY)
+
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # =================================================================
+        # PAGE 2 — Per-class Dice breakdown
+        # =================================================================
+        fig2, ax2 = plt.subplots(figsize=(11, max(4, 0.35 * len(results) + 3)))
+        fig2.patch.set_facecolor(FIG_BG)
+        ax2.axis("off")
+
+        fig2.text(
+            0.5, 0.97,
+            "Per-Class Dice Breakdown (Post-TTA)  —  NCR/NET (1) | ED (2) | ET (4)",
+            ha="center", va="top", fontsize=12, fontweight="bold", color=HDR_COLOR,
+        )
+
+        all_c1, all_c2, all_c4 = [], [], []
+        table2_data = []
+        for i, r in enumerate(results):
+            d = r["post_per_class"]
+            c1, c2, c4 = d.get(1, 0.0), d.get(2, 0.0), d.get(4, 0.0)
+            all_c1.append(c1)
+            all_c2.append(c2)
+            all_c4.append(c4)
+            table2_data.append([
+                r["patient_id"],
+                f"{c1:.4f}",
+                f"{c2:.4f}",
+                f"{c4:.4f}",
+            ])
+
+        table2_data.append([
+            "MEAN",
+            f"{sum(all_c1)/len(all_c1):.4f}",
+            f"{sum(all_c2)/len(all_c2):.4f}",
+            f"{sum(all_c4)/len(all_c4):.4f}",
+        ])
+
+        row_colors2 = [
+            [ROW_EVEN if i % 2 == 0 else ROW_ODD] * 4
+            for i in range(len(results))
+        ] + [[MEAN_COLOR] * 4]
+
+        tbl2 = ax2.table(
+            cellText=table2_data,
+            colLabels=["Patient ID", "NCR/NET (1)", "ED (2)", "ET (4)"],
+            cellColours=row_colors2,
+            cellLoc="center",
+            loc="center",
+        )
+        tbl2.auto_set_font_size(False)
+        tbl2.set_fontsize(8)
+        tbl2.auto_set_column_width([0, 1, 2, 3])
+
+        for col in range(4):
+            cell = tbl2[0, col]
+            cell.set_facecolor(HDR_COLOR)
+            cell.set_text_props(color="white", fontweight="bold", family=FONT_FAMILY)
+
+        pdf.savefig(fig2, bbox_inches="tight")
+        plt.close(fig2)
+
+        # =================================================================
+        # PAGE 3 — Configuration summary
+        # =================================================================
+        fig3, ax3 = plt.subplots(figsize=(8.5, 5))
+        fig3.patch.set_facecolor(FIG_BG)
+        ax3.axis("off")
+
+        fig3.text(
+            0.5, 0.97,
+            "Experiment Configuration",
+            ha="center", va="top", fontsize=13, fontweight="bold", color=HDR_COLOR,
+        )
+
+        cfg_rows = [
+            ["TTA Iterations",  str(CFG["tta_iterations"])],
+            ["Learning Rate",   str(CFG["lr"])],
+            ["Lambda Energy",   str(CFG["lambda_energy"])],
+            ["Weight Decay",    str(CFG["weight_decay"])],
+            ["Beta 1 / Beta 2", f"{CFG['betas'][0]} / {CFG['betas'][1]}"],
+            ["ROI Size",        str(CFG["roi_size"])],
+            ["Patients",        str(len(results))],
+            ["Backbone",        "MONAI SegResNet (brats_mri_segmentation)"],
+            ["Weights Path",    CFG["bundle_weights"]],
+            ["Generated",       datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ]
+
+        cfg_colors = [
+            [ROW_EVEN if i % 2 == 0 else ROW_ODD] * 2
+            for i in range(len(cfg_rows))
+        ]
+
+        tbl3 = ax3.table(
+            cellText=cfg_rows,
+            colLabels=["Parameter", "Value"],
+            cellColours=cfg_colors,
+            cellLoc="left",
+            loc="center",
+        )
+        tbl3.auto_set_font_size(False)
+        tbl3.set_fontsize(9)
+        tbl3.auto_set_column_width([0, 1])
+
+        for col in range(2):
+            cell = tbl3[0, col]
+            cell.set_facecolor(HDR_COLOR)
+            cell.set_text_props(color="white", fontweight="bold", family=FONT_FAMILY)
+
+        pdf.savefig(fig3, bbox_inches="tight")
+        plt.close(fig3)
+
+        # PDF metadata
+        pdf_meta = pdf.infodict()
+        pdf_meta["Title"]   = "EIDOS TTA Results Report"
+        pdf_meta["Author"]  = "EIDOS Framework"
+        pdf_meta["Subject"] = "BraTS 2021 Test-Time Adaptation Evaluation"
+
+    return filename
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -414,11 +636,18 @@ def main() -> None:
     print("  EIDOS: Test-Time Adaptation -- Real BraTS Clinical Evaluation")
     print(SEP)
 
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device -- hardware-agnostic: NVIDIA GPU -> Apple Silicon -> CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"\n  [Device]  {device}")
     if device.type == "cuda":
         print(f"  [GPU]     {torch.cuda.get_device_name(0)}")
+    elif device.type == "mps":
+        print(f"  [GPU]     Apple Silicon (MPS)")
 
     # Reproducibility
     torch.manual_seed(42)
@@ -601,6 +830,16 @@ def main() -> None:
     # 4.  Results Summary
     # =========================================================================
     print_results_table(results)
+
+    # =========================================================================
+    # 5.  PDF Report
+    # =========================================================================
+    print(f"\n{SEP_THIN}")
+    print("  [5] Generating PDF Report")
+    print(SEP_THIN)
+    pdf_path = generate_pdf_report(results)
+    print(f"  PDF saved to: {pdf_path}")
+    print(SEP)
 
 
 if __name__ == "__main__":
